@@ -1,12 +1,21 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from typing import List, Optional
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+# Create rate limiter
+limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="Student Management API",
     description="A simple API to manage students",
     version="1.0.0"
 )
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # In-memory database
 students_db = []
@@ -47,7 +56,8 @@ def health_check():
 
 # Get all students
 @app.get("/students", response_model=List[Student])
-def get_students():
+@limiter.limit("5/minute")  # 5 requests per minute
+def get_students(request: Request):
     return students_db
 
 # Get student by ID
