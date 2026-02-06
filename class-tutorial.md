@@ -9,8 +9,9 @@ By the end of this class, students will:
 - Create a working API
 - Write comprehensive tests using pytest
 - Understand fixtures and test isolation
+- Implement and test rate limiting
 
-**Estimated Time:** 90 minutes
+**Estimated Time:** 110 minutes
 
 ---
 
@@ -748,9 +749,281 @@ pytest --cov=app --cov-report=term-missing
 
 ---
 
+## 🚦 **PART 9: RATE LIMITING WITH SLOWAPI (20 minutes)**
+
+### Step 26: What is Rate Limiting?
+**Say:** "Rate limiting protects your API by limiting how many requests a client can make in a certain time period."
+
+**Why rate limiting?**
+- Prevents abuse and spam
+- Protects your server from overload
+- Ensures fair usage for all users
+- Common in production APIs
+
+**Example:** "Allow 5 requests per minute per user"
+
+---
+
+### Step 27: Install SlowAPI
+**Say:** "We'll use slowapi, a rate limiting library for FastAPI."
+
+**Command:**
+```bash
+uv add slowapi
+```
+
+**Explain:** slowapi is inspired by Flask-Limiter and works seamlessly with FastAPI.
+
+---
+
+### Step 28: Set Up Rate Limiting
+**Say:** "Let's add rate limiting to our API. We'll configure it step by step."
+
+**Update `app/main.py` - Add imports at the top:**
+
+```python
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+from typing import List, Optional
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+```
+
+**Add after imports, before app creation:**
+
+```python
+# Create rate limiter
+limiter = Limiter(key_func=get_remote_address)
+```
+
+**Update app creation:**
+
+```python
+app = FastAPI(
+    title="Student Management API",
+    description="A simple API to manage students",
+    version="1.0.0"
+)
+
+# Attach limiter to app
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+```
+
+**Explain:**
+- `key_func=get_remote_address` - Identifies users by IP address
+- `app.state.limiter` - Attaches limiter to FastAPI app
+- Exception handler - Handles rate limit errors gracefully
+
+---
+
+### Step 29: Apply Rate Limits to Endpoints
+**Say:** "Now let's add rate limits to our endpoints. We'll start with the GET endpoints."
+
+**Update the `get_students` endpoint:**
+
+```python
+# Get all students
+@app.get("/students", response_model=List[Student])
+@limiter.limit("5/minute")  # 5 requests per minute
+def get_students(request: Request):
+    return students_db
+```
+
+**Update the `get_student` endpoint:**
+
+```python
+# Get student by ID
+@app.get("/students/{student_id}", response_model=Student)
+@limiter.limit("10/minute")  # 10 requests per minute
+def get_student(request: Request, student_id: int):
+    student = next((s for s in students_db if s["id"] == student_id), None)
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    return student
+```
+
+**Important:** Notice we added `request: Request` parameter! Rate limiting needs the request object.
+
+**Explain:**
+- `@limiter.limit("5/minute")` - Decorator that applies rate limit
+- Format: `"number/time_unit"` (e.g., "5/minute", "100/hour")
+- Different endpoints can have different limits
+- `request: Request` parameter is required for rate limiting
+
+---
+
+### Step 30: Test Rate Limiting Manually
+**Say:** "Let's test our rate limiting to see it in action!"
+
+**Start server:**
+```bash
+uvicorn app.main:app --reload
+```
+
+**Test in browser or with curl:**
+```bash
+# Make 5 requests quickly
+curl http://localhost:8000/students
+curl http://localhost:8000/students
+curl http://localhost:8000/students
+curl http://localhost:8000/students
+curl http://localhost:8000/students
+# 6th request should fail with 429
+curl http://localhost:8000/students
+```
+
+**Show students:**
+- First 5 requests work (200 OK)
+- 6th request gets 429 Too Many Requests
+- Error message shows rate limit exceeded
+
+**Stop server:** Press `Ctrl+C`
+
+---
+
+### Step 31: Write Tests for Rate Limiting
+**Say:** "Now let's write tests to verify rate limiting works correctly."
+
+**Add to `tests/test_main.py`:**
+
+```python
+def test_rate_limit_within_limit(client):
+    """Test that requests within rate limit succeed"""
+    # Make 5 requests (within limit of 5/minute)
+    for i in range(5):
+        response = client.get("/students")
+        assert response.status_code == 200, f"Request {i+1} should succeed"
+
+def test_rate_limit_exceeded(client):
+    """Test that exceeding rate limit returns 429"""
+    # Make 5 requests (within limit)
+    for i in range(5):
+        client.get("/students")
+    
+    # 6th request should be rate limited
+    response = client.get("/students")
+    assert response.status_code == 429, "Should return 429 Too Many Requests"
+    assert "rate limit" in response.json()["detail"].lower()
+
+def test_rate_limit_different_endpoints(client):
+    """Test that different endpoints have separate rate limits"""
+    # Exhaust limit on /students (5 requests)
+    for i in range(5):
+        client.get("/students")
+    
+    # /students should be rate limited
+    response = client.get("/students")
+    assert response.status_code == 429
+    
+    # But /health should still work (no rate limit)
+    response = client.get("/health")
+    assert response.status_code == 200
+```
+
+**Run tests:**
+```bash
+pytest tests/test_main.py::test_rate_limit_within_limit -v
+pytest tests/test_main.py::test_rate_limit_exceeded -v
+```
+
+**Explain:**
+- Test normal usage (within limit)
+- Test exceeding limit (should get 429)
+- Test that different endpoints have separate limits
+
+---
+
+### Step 32: Advanced - Reset Rate Limit in Tests
+**Say:** "There's a challenge: rate limits persist between tests. Let's fix this."
+
+**Problem:** Rate limit state persists, so tests might fail if run multiple times.
+
+**Solution: Add a fixture to reset rate limiter:**
+
+**Add to `tests/test_main.py` fixtures section:**
+
+```python
+@pytest.fixture(autouse=True)
+def reset_rate_limiter():
+    """Reset rate limiter state before each test"""
+    from slowapi import Limiter
+    from slowapi.util import get_remote_address
+    
+    # Clear the limiter's storage
+    if hasattr(app.state, 'limiter'):
+        # Reset the limiter's internal storage
+        app.state.limiter._storage.clear()
+    yield
+    # Cleanup after test
+    if hasattr(app.state, 'limiter'):
+        app.state.limiter._storage.clear()
+```
+
+**Better approach - Use a test-specific limiter:**
+
+**Update `tests/test_main.py` to create a fresh limiter for tests:**
+
+```python
+import pytest
+from fastapi.testclient import TestClient
+from app.main import app, students_db
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+# Create a fresh limiter for testing (in-memory, resets easily)
+test_limiter = Limiter(key_func=get_remote_address, storage_uri="memory://")
+
+@pytest.fixture
+def client():
+    """Create a test client with test limiter"""
+    # Replace app's limiter with test limiter
+    app.state.limiter = test_limiter
+    return TestClient(app)
+
+@pytest.fixture(autouse=True)
+def reset_database():
+    """Automatically reset database before each test"""
+    students_db.clear()
+    import app.main
+    app.main.next_id = 1
+    yield
+    students_db.clear()
+
+@pytest.fixture(autouse=True)
+def reset_rate_limiter():
+    """Reset rate limiter before each test"""
+    test_limiter._storage.clear()
+    yield
+    test_limiter._storage.clear()
+```
+
+**Explain:**
+- Test limiter uses in-memory storage
+- Easy to clear between tests
+- Ensures test isolation
+
+---
+
+### Step 33: Run All Rate Limiting Tests
+**Say:** "Let's run all our rate limiting tests!"
+
+**Command:**
+```bash
+pytest tests/test_main.py -k "rate_limit" -v
+```
+
+**Show students:**
+- All rate limiting tests passing
+- Tests are independent
+- Rate limiting works correctly
+
+---
+
 ## ✅ **WRAP-UP (5 minutes)**
 
-### Step 26: Summary
+### Step 34: Summary
 **Review what we learned:**
 
 1. ✅ Set up project with UV
@@ -759,12 +1032,16 @@ pytest --cov=app --cov-report=term-missing
 4. ✅ Used fixtures for test isolation
 5. ✅ Tested all CRUD operations
 6. ✅ Used parametrization
+7. ✅ Implemented rate limiting with slowapi
+8. ✅ Tested rate limiting functionality
 
 ### Key Takeaways:
 - **Tests should be independent** - Use fixtures!
 - **Test both success and failure** - Happy path + error cases
 - **Clear test names** - `test_<what>_<condition>_<expected>`
 - **Coverage matters** - Know what's tested
+- **Rate limiting protects APIs** - Limit requests per time period
+- **Test rate limits** - Verify both within limit and exceeded cases
 
 ---
 
@@ -810,6 +1087,11 @@ def test_something(client):
 - Create `/students/search?course=Math` endpoint
 - Write tests for it
 
+### Exercise 4: Advanced Rate Limiting
+- Add different rate limits to POST, PUT, DELETE endpoints
+- Test that rate limits reset after time window
+- Add rate limiting to the root endpoint with a higher limit
+
 ---
 
 ## ❓ **COMMON QUESTIONS**
@@ -826,6 +1108,12 @@ A: Yes! Use `@pytest.mark.skip` or `@pytest.mark.skipif`
 **Q: How do I test async endpoints?**
 A: Use `httpx.AsyncClient` and `@pytest.mark.asyncio`
 
+**Q: How does rate limiting work in tests?**
+A: Use a separate test limiter with in-memory storage that can be reset between tests. This ensures test isolation.
+
+**Q: Can I have different rate limits for different users?**
+A: Yes! Change the `key_func` in the limiter to identify users differently (e.g., by API key, user ID, etc.)
+
 ---
 
 ## 🎉 **END OF CLASS**
@@ -835,6 +1123,8 @@ A: Use `httpx.AsyncClient` and `@pytest.mark.asyncio`
 - Write comprehensive tests with pytest
 - Use fixtures for test isolation
 - Test API endpoints properly
+- Implement rate limiting with slowapi
+- Test rate limiting functionality
 
 **Next Steps:**
 - Practice writing more tests
